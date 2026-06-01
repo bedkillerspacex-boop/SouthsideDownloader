@@ -1,0 +1,8 @@
+.minecraft-test/
+.minecraft-name-test/
+.minecraft-progress-test/
+.publish-temp/
+build/**/bin/
+build/**/obj/
+*.tmp-*
+*.tmp

@@ -1,0 +1,2 @@
+SouthSideDownloader.exe filter=lfs diff=lfs merge=lfs -text
+resources/mods.zip filter=lfs diff=lfs merge=lfs -text

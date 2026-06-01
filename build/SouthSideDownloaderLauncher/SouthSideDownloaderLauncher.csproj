@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net9.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>SouthSideDownloader</AssemblyName>
+    <RootNamespace>SouthSideDownloaderLauncher</RootNamespace>
+    <SatelliteResourceLanguages>zh-CN</SatelliteResourceLanguages>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="..\..\download-minecraft-fabric.ps1" LogicalName="download-minecraft-fabric.ps1" />
+    <EmbeddedResource Include="..\..\SouthSideDownloader.bat" LogicalName="SouthSideDownloader.bat" />
+    <EmbeddedResource Include="..\..\README.md" LogicalName="README.md" />
+    <EmbeddedResource Include="..\..\resources\mods.zip" LogicalName="resources/mods.zip" />
+    <EmbeddedResource Include="..\..\resources\help.zip" LogicalName="resources/help.zip" />
+    <EmbeddedResource Include="..\..\resources\Plain Craft Launcher 2.exe" LogicalName="resources/Plain Craft Launcher 2.exe" />
+  </ItemGroup>
+</Project>
