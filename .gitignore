@@ -4,5 +4,6 @@
 .publish-temp/
 build/**/bin/
 build/**/obj/
+resources/mods.zip
 *.tmp-*
 *.tmp

@@ -12,6 +12,18 @@
 - 自动写入启动器配置，并释放内置 PCL2 启动器与桌面快捷方式。
 - 重复运行会尽量复用缓存，减少校验、解压和重复写入。
 
+## 内置模组
+
+公开仓库不包含 `resources/mods.zip`。
+
+如果你需要让下载器自动导入内置模组，请自行准备 `mods.zip`，并放到：
+
+```text
+resources/mods.zip
+```
+
+没有这个文件时，下载器仍可构建和运行，只会跳过内置模组导入。
+
 ## 使用
 
 双击运行：
@@ -49,4 +61,4 @@ SouthSideDownloader.bat -FabricLoaderVersion 0.16.14
 
 - 本工具只负责下载和整理游戏文件，不负责账号登录。
 - Minecraft `1.21.4` 需要 Java 21。
-- 大文件使用 Git LFS 管理，克隆后请确保已安装并启用 Git LFS。
+- 发布用的 `SouthSideDownloader.exe` 使用 Git LFS 管理，克隆后请确保已安装并启用 Git LFS。

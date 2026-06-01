@@ -13,7 +13,7 @@
     <EmbeddedResource Include="..\..\download-minecraft-fabric.ps1" LogicalName="download-minecraft-fabric.ps1" />
     <EmbeddedResource Include="..\..\SouthSideDownloader.bat" LogicalName="SouthSideDownloader.bat" />
     <EmbeddedResource Include="..\..\README.md" LogicalName="README.md" />
-    <EmbeddedResource Include="..\..\resources\mods.zip" LogicalName="resources/mods.zip" />
+    <EmbeddedResource Include="..\..\resources\mods.zip" LogicalName="resources/mods.zip" Condition="Exists('..\..\resources\mods.zip')" />
     <EmbeddedResource Include="..\..\resources\help.zip" LogicalName="resources/help.zip" />
     <EmbeddedResource Include="..\..\resources\Plain Craft Launcher 2.exe" LogicalName="resources/Plain Craft Launcher 2.exe" />
   </ItemGroup>
