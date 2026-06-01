@@ -4,7 +4,7 @@
     [string]$FabricLoaderVersion = "latest",
     [string]$InstallVersionName = "SouthsideNextgen",
     [string]$ProfileName = "SouthsideNextgen",
-    [int]$MaxThreads = 16,
+    [int]$MaxThreads = 0,
     [int]$RetryCount = 3,
     [int]$NoProgressTimeoutSeconds = 15,
     [int]$HedgeAfterSeconds = 5,
@@ -37,6 +37,7 @@ $AssetsBase = "https://resources.download.minecraft.net"
 $FabricMetaBase = "https://meta.fabricmc.net"
 $FabricMavenBase = "https://maven.fabricmc.net"
 $script:ExitCleanupDirectories = New-Object System.Collections.Generic.List[string]
+$script:EnsuredDirectoryCache = @{}
 
 function Show-Help {
     Write-Host "南侧下载器 - 自动下载 Minecraft $MinecraftVersion + Fabric"
@@ -82,6 +83,27 @@ function Ensure-Directory {
     if (-not [string]::IsNullOrWhiteSpace($Path) -and -not (Test-Path -LiteralPath $Path)) {
         New-Item -ItemType Directory -Path $Path | Out-Null
     }
+}
+
+function Ensure-DirectoryFast {
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return
+    }
+
+    try {
+        $fullPath = [System.IO.Path]::GetFullPath($Path).TrimEnd("\").ToLowerInvariant()
+    } catch {
+        $fullPath = ([string]$Path).ToLowerInvariant()
+    }
+
+    if ($script:EnsuredDirectoryCache.ContainsKey($fullPath)) {
+        return
+    }
+
+    Ensure-Directory $Path
+    $script:EnsuredDirectoryCache[$fullPath] = $true
 }
 
 function Test-SafeTempChildPath {
@@ -166,11 +188,17 @@ function Test-FileMetadataMatches {
 function Set-DownloadNetworkTuning {
     param([int]$ThreadCount)
 
-    $connectionLimit = [Math]::Max(32, [Math]::Min(256, $ThreadCount * 4))
+    $effectiveThreads = $ThreadCount
+    if ($effectiveThreads -lt 1) {
+        $effectiveThreads = 96
+    }
+
+    $connectionLimit = [Math]::Max(64, [Math]::Min(512, $effectiveThreads * 4))
     try {
         [Net.ServicePointManager]::DefaultConnectionLimit = $connectionLimit
         [Net.ServicePointManager]::Expect100Continue = $false
         [Net.ServicePointManager]::UseNagleAlgorithm = $false
+        [Net.ServicePointManager]::MaxServicePointIdleTime = 30000
     } catch {
     }
     Write-Host "网络并发连接上限：$connectionLimit"
@@ -236,9 +264,9 @@ function Invoke-WithUserRetry {
 }
 
 function Read-ThreadCount {
-    param([int]$DefaultThreads = 16)
+    param([int]$DefaultThreads = 0)
 
-    $answer = Read-Host "请输入下载线程数，直接回车默认 $DefaultThreads 线程"
+    $answer = Read-Host "请输入下载线程数，直接回车自动动态线程"
     if ([string]::IsNullOrWhiteSpace($answer)) {
         return $DefaultThreads
     }
@@ -254,12 +282,78 @@ function Read-ThreadCount {
         return $DefaultThreads
     }
 
-    if ($parsed -gt 64) {
-        Write-Host "线程数太大，已限制为 64 线程。"
-        return 64
+    if ($parsed -gt 128) {
+        Write-Host "线程数太大，已限制为 128 线程。"
+        return 128
     }
 
     return $parsed
+}
+
+function Resolve-DynamicThreadLimit {
+    param(
+        [int]$RequestedThreadCount,
+        [int]$PendingFileCount,
+        [int]$TotalFileCount
+    )
+
+    if ($RequestedThreadCount -gt 0) {
+        return [Math]::Max(1, [Math]::Min(128, [Math]::Min($RequestedThreadCount, $PendingFileCount)))
+    }
+
+    if ($PendingFileCount -le 0) {
+        return 1
+    }
+
+    $processorCount = [Math]::Max(2, [Environment]::ProcessorCount)
+    $autoLimit = 16
+    if ($PendingFileCount -ge 2000) {
+        $autoLimit = 96
+    } elseif ($PendingFileCount -ge 800) {
+        $autoLimit = 72
+    } elseif ($PendingFileCount -ge 250) {
+        $autoLimit = 48
+    } elseif ($PendingFileCount -ge 80) {
+        $autoLimit = 32
+    } elseif ($PendingFileCount -ge 24) {
+        $autoLimit = 24
+    }
+
+    $cpuAwareLimit = [Math]::Max($autoLimit, [Math]::Min(96, $processorCount * 6))
+    return [Math]::Max(1, [Math]::Min(128, [Math]::Min($cpuAwareLimit, $PendingFileCount)))
+}
+
+function Resolve-HedgeDelayMilliseconds {
+    param(
+        [Nullable[Int64]]$Size,
+        [int]$PendingFileCount,
+        [int]$RequestedDelaySeconds
+    )
+
+    if ($RequestedDelaySeconds -le 0) {
+        return -1
+    }
+
+    $requestedMilliseconds = $RequestedDelaySeconds * 1000
+    if ($PendingFileCount -ge 500) {
+        return [Math]::Min($requestedMilliseconds, 350)
+    }
+    if ($PendingFileCount -ge 120) {
+        return [Math]::Min($requestedMilliseconds, 600)
+    }
+    if ($Size -ne $null -and $Size -gt 0) {
+        if ($Size -le 262144) {
+            return [Math]::Min($requestedMilliseconds, 400)
+        }
+        if ($Size -le 2097152) {
+            return [Math]::Min($requestedMilliseconds, 800)
+        }
+        if ($Size -ge 52428800) {
+            return [Math]::Min($requestedMilliseconds, 2500)
+        }
+    }
+
+    return [Math]::Min($requestedMilliseconds, 1500)
 }
 
 function Convert-ToHtmlText {
@@ -353,6 +447,8 @@ function Show-InstallTutorial {
     <li>确认 Java 使用 Java 21。</li>
     <li>内置模组已经放在：<code>$(Convert-ToHtmlText (Join-Path $GameDir "mods"))</code></li>
     <li>首次使用无需兑换/充值这一步。</li>
+    <li>如果不勾选自动登录，很可能会崩溃！</li>
+    <li>如果界面显示不全，请去原版我的世界设置中更改界面大小。</li>
     <li>进入世界后，按下 <code>0</code> 打开云参，按下 <code>右 Shift</code> 打开南方 ClickGUI。</li>
   </ol>
 </body>
@@ -601,7 +697,7 @@ function Save-Utf8Json {
         [object]$Object
     )
 
-    Ensure-Directory (Split-Path -Parent $Path)
+    Ensure-DirectoryFast (Split-Path -Parent $Path)
     $json = $Object | ConvertTo-Json -Depth 100
     if ((Test-Path -LiteralPath $Path -PathType Leaf) -and ([System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::UTF8) -eq $json)) {
         return
@@ -713,7 +809,7 @@ function Save-FileValidationCache {
     }
 
     try {
-        Ensure-Directory (Split-Path -Parent $script:FileValidationCachePath)
+        Ensure-DirectoryFast (Split-Path -Parent $script:FileValidationCachePath)
         $entries = New-Object System.Collections.ArrayList
         foreach ($key in $script:FileValidationCache.Keys) {
             $entry = $script:FileValidationCache[$key]
@@ -753,7 +849,7 @@ function Initialize-JsonCache {
 
     $script:JsonCacheDir = Join-Path $MinecraftDir ".southside-downloader-json-cache"
     $script:JsonCachePathByUrl = @{}
-    Ensure-Directory $script:JsonCacheDir
+    Ensure-DirectoryFast $script:JsonCacheDir
 }
 
 function Get-JsonCachePath {
@@ -816,7 +912,7 @@ function Write-JsonCacheEntry {
     }
 
     try {
-        Ensure-Directory (Split-Path -Parent $cachePath)
+        Ensure-DirectoryFast (Split-Path -Parent $cachePath)
         if ((Test-Path -LiteralPath $cachePath -PathType Leaf) -and ([System.IO.File]::ReadAllText($cachePath, [System.Text.Encoding]::UTF8) -eq $Content)) {
             [System.IO.File]::SetLastWriteTimeUtc($cachePath, (Get-Date).ToUniversalTime())
             return
@@ -1063,6 +1159,72 @@ function Write-FixedProgressLines {
     }
 }
 
+function New-FastHttpRequest {
+    param(
+        [string]$Url,
+        [int]$TimeoutMilliseconds = 120000,
+        [int]$ReadWriteTimeoutMilliseconds = 15000,
+        [bool]$EnableDecompression = $false,
+        [bool]$UseSystemProxy = $false
+    )
+
+    $request = [System.Net.HttpWebRequest]::Create($Url)
+    $request.Timeout = $TimeoutMilliseconds
+    $request.ReadWriteTimeout = $ReadWriteTimeoutMilliseconds
+    if (-not $UseSystemProxy) {
+        $request.Proxy = $null
+    }
+    $request.KeepAlive = $true
+    $request.AllowAutoRedirect = $true
+    if ($EnableDecompression) {
+        $request.AutomaticDecompression = [System.Net.DecompressionMethods]::GZip -bor [System.Net.DecompressionMethods]::Deflate
+    } else {
+        $request.Headers["Accept-Encoding"] = "identity"
+    }
+    return $request
+}
+
+function Invoke-FastTextRequest {
+    param(
+        [string]$Url,
+        [int]$TimeoutMilliseconds = 45000
+    )
+
+    $response = $null
+    $stream = $null
+    $reader = $null
+    try {
+        $request = New-FastHttpRequest -Url $Url -TimeoutMilliseconds $TimeoutMilliseconds -ReadWriteTimeoutMilliseconds $TimeoutMilliseconds -EnableDecompression $true
+        try {
+            $response = $request.GetResponse()
+        } catch {
+            $request = New-FastHttpRequest -Url $Url -TimeoutMilliseconds $TimeoutMilliseconds -ReadWriteTimeoutMilliseconds $TimeoutMilliseconds -EnableDecompression $true -UseSystemProxy $true
+            $response = $request.GetResponse()
+        }
+        $stream = $response.GetResponseStream()
+        $encoding = [System.Text.Encoding]::UTF8
+        if (-not [string]::IsNullOrWhiteSpace($response.CharacterSet)) {
+            try {
+                $encoding = [System.Text.Encoding]::GetEncoding($response.CharacterSet)
+            } catch {
+                $encoding = [System.Text.Encoding]::UTF8
+            }
+        }
+        $reader = New-Object System.IO.StreamReader($stream, $encoding, $true)
+        return $reader.ReadToEnd()
+    } finally {
+        if ($reader -ne $null) {
+            $reader.Dispose()
+        }
+        if ($stream -ne $null) {
+            $stream.Dispose()
+        }
+        if ($response -ne $null) {
+            $response.Dispose()
+        }
+    }
+}
+
 function Invoke-DownloadFileWithProgress {
     param(
         [string]$Url,
@@ -1081,14 +1243,23 @@ function Invoke-DownloadFileWithProgress {
             $existingBytes = (Get-Item -LiteralPath $Path).Length
         }
 
-        $request = [System.Net.HttpWebRequest]::Create($Url)
-        $request.Timeout = 120000
-        $request.ReadWriteTimeout = [Math]::Max(5, $NoProgressTimeoutSeconds) * 1000
-        if ($existingBytes -gt 0) {
-            $request.AddRange($existingBytes)
+        function New-DownloadRequest {
+            param([bool]$UseSystemProxy)
+
+            $downloadRequest = New-FastHttpRequest -Url $Url -ReadWriteTimeoutMilliseconds ([Math]::Max(5, $NoProgressTimeoutSeconds) * 1000) -UseSystemProxy $UseSystemProxy
+            if ($existingBytes -gt 0) {
+                $downloadRequest.AddRange($existingBytes)
+            }
+            return $downloadRequest
         }
 
-        $response = $request.GetResponse()
+        $request = New-DownloadRequest -UseSystemProxy $false
+        try {
+            $response = $request.GetResponse()
+        } catch {
+            $request = New-DownloadRequest -UseSystemProxy $true
+            $response = $request.GetResponse()
+        }
         $inputStream = $response.GetResponseStream()
 
         $resumeAccepted = $existingBytes -gt 0 -and $response.StatusCode -eq [System.Net.HttpStatusCode]::PartialContent
@@ -1224,9 +1395,10 @@ function Invoke-JsonWithFallback {
     foreach ($url in $uniqueUrls) {
         try {
             Write-Host "读取${Name}：$url"
-            $response = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 45
-            Write-JsonCacheEntry -Url $url -Content $response.Content
-            return ($response.Content | ConvertFrom-Json)
+            $content = Invoke-FastTextRequest -Url $url -TimeoutMilliseconds 45000
+            $json = $content | ConvertFrom-Json
+            Write-JsonCacheEntry -Url $url -Content $content
+            return $json
         } catch {
             $errors.Add("$url -> $($_.Exception.Message)")
         }
@@ -1276,55 +1448,12 @@ function Invoke-DownloadWithFallback {
         [Nullable[Int64]]$Size,
         [string]$Name,
         [int]$RetryCount = 3,
-        [int]$NoProgressTimeoutSeconds = 15,
-        [string]$TempPath = ""
+        [int]$NoProgressTimeoutSeconds = 15
     )
 
-    if (Test-FileMatches -Path $Path -Sha1 $Sha1 -Size $Size) {
-        Write-Host "跳过${Name}：文件已存在且校验通过"
-        return
-    }
-
-    Ensure-Directory (Split-Path -Parent $Path)
-    if ([string]::IsNullOrWhiteSpace($TempPath)) {
-        $tempPath = "$Path.tmp-$([Guid]::NewGuid().ToString('N'))"
-    } else {
-        $tempPath = $TempPath
-    }
-    $errors = New-Object System.Collections.Generic.List[string]
-
-    foreach ($url in (Get-UniqueUrls $Urls)) {
-        try {
-            for ($attempt = 1; $attempt -le [Math]::Max(1, $RetryCount); $attempt++) {
-                try {
-                    Write-Host "下载${Name}：$url（第 $attempt 次）"
-                    Invoke-DownloadFileWithProgress -Url $url -Path $tempPath -Name $Name -NoProgressTimeoutSeconds $NoProgressTimeoutSeconds
-                    break
-                } catch {
-                    if ($attempt -ge [Math]::Max(1, $RetryCount)) {
-                        throw
-                    }
-                    Write-Host "连接中断，正在自动重连：$Name"
-                    Start-Sleep -Milliseconds (300 * $attempt)
-                }
-            }
-
-            if (-not (Test-FileMatches -Path $tempPath -Sha1 $Sha1 -Size $Size)) {
-                throw "下载完成，但文件校验失败"
-            }
-
-            Move-Item -LiteralPath $tempPath -Destination $Path -Force
-            Set-FileValidationCacheEntry -Path $Path -Sha1 $Sha1
-            return
-        } catch {
-            $errors.Add("$url -> $($_.Exception.Message)")
-            if (Test-Path -LiteralPath $tempPath) {
-                Remove-Item -LiteralPath $tempPath -Force
-            }
-        }
-    }
-
-    throw "下载${Name}失败。`n$($errors -join "`n")"
+    $downloadItems = New-Object System.Collections.ArrayList
+    Add-DownloadItem -List $downloadItems -Urls $Urls -Path $Path -Sha1 $Sha1 -Size $Size -Name $Name
+    Download-Items -Items $downloadItems -Title "下载${Name}" -ThreadCount 1 -RetryCount $RetryCount -NoProgressTimeoutSeconds $NoProgressTimeoutSeconds -HedgeAfterSeconds 1
 }
 
 function Invoke-DownloadWorker {
@@ -1342,18 +1471,35 @@ function Invoke-DownloadWorker {
     $ErrorActionPreference = "Stop"
     $ProgressPreference = "SilentlyContinue"
     try {
-        [Net.ServicePointManager]::DefaultConnectionLimit = 256
+        [Net.ServicePointManager]::DefaultConnectionLimit = 512
         [Net.ServicePointManager]::Expect100Continue = $false
         [Net.ServicePointManager]::UseNagleAlgorithm = $false
+        [Net.ServicePointManager]::MaxServicePointIdleTime = 30000
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
     } catch {
     }
 
+    $workerEnsuredDirectories = @{}
     function Ensure-WorkerDirectory {
         param([string]$WorkerPath)
-        if (-not [string]::IsNullOrWhiteSpace($WorkerPath) -and -not (Test-Path -LiteralPath $WorkerPath)) {
+        if ([string]::IsNullOrWhiteSpace($WorkerPath)) {
+            return
+        }
+
+        try {
+            $workerFullPath = [System.IO.Path]::GetFullPath($WorkerPath).TrimEnd("\").ToLowerInvariant()
+        } catch {
+            $workerFullPath = ([string]$WorkerPath).ToLowerInvariant()
+        }
+
+        if ($workerEnsuredDirectories.ContainsKey($workerFullPath)) {
+            return
+        }
+
+        if (-not (Test-Path -LiteralPath $WorkerPath)) {
             New-Item -ItemType Directory -Path $WorkerPath -Force | Out-Null
         }
+        $workerEnsuredDirectories[$workerFullPath] = $true
     }
 
     function Get-WorkerSha1 {
@@ -1384,6 +1530,25 @@ function Invoke-DownloadWorker {
         return $true
     }
 
+    function New-WorkerFastHttpRequest {
+        param(
+            [string]$WorkerUrl,
+            [int]$WorkerReadWriteTimeoutMilliseconds,
+            [bool]$UseSystemProxy = $false
+        )
+
+        $request = [System.Net.HttpWebRequest]::Create($WorkerUrl)
+        $request.Timeout = 120000
+        $request.ReadWriteTimeout = $WorkerReadWriteTimeoutMilliseconds
+        if (-not $UseSystemProxy) {
+            $request.Proxy = $null
+        }
+        $request.KeepAlive = $true
+        $request.AllowAutoRedirect = $true
+        $request.Headers["Accept-Encoding"] = "identity"
+        return $request
+    }
+
     function Invoke-WorkerDownloadFile {
         param(
             [string]$WorkerUrl,
@@ -1401,14 +1566,23 @@ function Invoke-DownloadWorker {
                 $existingBytes = (Get-Item -LiteralPath $WorkerPath).Length
             }
 
-            $request = [System.Net.HttpWebRequest]::Create($WorkerUrl)
-            $request.Timeout = 120000
-            $request.ReadWriteTimeout = [Math]::Max(5, $WorkerNoProgressTimeoutSeconds) * 1000
-            if ($existingBytes -gt 0) {
-                $request.AddRange($existingBytes)
+            function New-WorkerDownloadRequest {
+                param([bool]$UseSystemProxy)
+
+                $workerRequest = New-WorkerFastHttpRequest -WorkerUrl $WorkerUrl -WorkerReadWriteTimeoutMilliseconds ([Math]::Max(5, $WorkerNoProgressTimeoutSeconds) * 1000) -UseSystemProxy $UseSystemProxy
+                if ($existingBytes -gt 0) {
+                    $workerRequest.AddRange($existingBytes)
+                }
+                return $workerRequest
             }
 
-            $response = $request.GetResponse()
+            $request = New-WorkerDownloadRequest -UseSystemProxy $false
+            try {
+                $response = $request.GetResponse()
+            } catch {
+                $request = New-WorkerDownloadRequest -UseSystemProxy $true
+                $response = $request.GetResponse()
+            }
             $inputStream = $response.GetResponseStream()
 
             $resumeAccepted = $existingBytes -gt 0 -and $response.StatusCode -eq [System.Net.HttpStatusCode]::PartialContent
@@ -1445,6 +1619,8 @@ function Invoke-DownloadWorker {
         Path = $Path
         Status = ""
         Message = ""
+        TempLength = [Int64]0
+        TempSha1 = ""
     }
 
     if (Test-WorkerFileMatches -WorkerPath $Path -WorkerSha1 $Sha1 -WorkerSize $Size) {
@@ -1479,18 +1655,11 @@ function Invoke-DownloadWorker {
                 throw "下载完成，但文件校验失败"
             }
 
-            if (Test-WorkerFileMatches -WorkerPath $Path -WorkerSha1 $Sha1 -WorkerSize $Size) {
-                if (Test-Path -LiteralPath $tempPath) {
-                    Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue
-                }
-                $result.Status = "跳过"
-                $result.Message = "已有其他源完成"
-                return [pscustomobject]$result
-            }
-
-            Move-Item -LiteralPath $tempPath -Destination $Path -Force
+            $tempFile = Get-Item -LiteralPath $tempPath -ErrorAction Stop
             $result.Status = "完成"
             $result.Message = $url
+            $result.TempLength = [Int64]$tempFile.Length
+            $result.TempSha1 = ([string]$Sha1).ToLowerInvariant()
             return [pscustomobject]$result
         } catch {
             $errors.Add("$url -> $($_.Exception.Message)")
@@ -1792,7 +1961,7 @@ function Download-Items {
     }
 
     $Items = $pendingDownloadItems
-    $threadLimit = [Math]::Max(1, [Math]::Min($ThreadCount, $Items.Count))
+    $threadLimit = Resolve-DynamicThreadLimit -RequestedThreadCount $ThreadCount -PendingFileCount $Items.Count -TotalFileCount $total
     $runspaceLimit = $threadLimit
     if ($HedgeAfterSeconds -gt 0) {
         $runspaceLimit = [Math]::Min(256, [Math]::Max($threadLimit, $threadLimit * 2))
@@ -1802,9 +1971,54 @@ function Download-Items {
     $pool = [RunspaceFactory]::CreateRunspacePool(1, $runspaceLimit)
     $pool.Open()
     $jobs = New-Object System.Collections.ArrayList
+    $downloadTempPaths = @{}
     $scriptBlock = ${function:Invoke-DownloadWorker}
 
     try {
+        function Register-DownloadTempPath {
+            param([string]$Path)
+
+            if ([string]::IsNullOrWhiteSpace($Path)) {
+                return
+            }
+
+            try {
+                $tempKey = [System.IO.Path]::GetFullPath($Path).ToLowerInvariant()
+            } catch {
+                $tempKey = ([string]$Path).ToLowerInvariant()
+            }
+            $downloadTempPaths[$tempKey] = $Path
+        }
+
+        function Remove-DownloadTempPath {
+            param([string]$Path)
+
+            if ([string]::IsNullOrWhiteSpace($Path)) {
+                return
+            }
+
+            try {
+                $tempKey = [System.IO.Path]::GetFullPath($Path).ToLowerInvariant()
+            } catch {
+                $tempKey = ([string]$Path).ToLowerInvariant()
+            }
+
+            for ($deleteAttempt = 1; $deleteAttempt -le 5; $deleteAttempt++) {
+                if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+                    break
+                }
+                Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+                if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+                    break
+                }
+                Start-Sleep -Milliseconds (80 * $deleteAttempt)
+            }
+
+            if (-not (Test-Path -LiteralPath $Path -PathType Leaf) -and $downloadTempPaths.ContainsKey($tempKey)) {
+                $downloadTempPaths.Remove($tempKey)
+            }
+        }
+
         function Start-QueuedDownload {
             param(
                 [object]$Item,
@@ -1819,31 +2033,50 @@ function Download-Items {
                 $tempKind = "primary"
             }
             $tempPath = "$($Item.Path).tmp-$tempKind-$([Guid]::NewGuid().ToString('N'))"
+            Register-DownloadTempPath -Path $tempPath
 
             $powershell = [PowerShell]::Create()
-            $powershell.RunspacePool = $pool
-            [void]$powershell.AddScript($scriptBlock)
-            [void]$powershell.AddArgument([string[]]$Urls)
-            [void]$powershell.AddArgument($Item.Path)
-            [void]$powershell.AddArgument($Item.Sha1)
-            [void]$powershell.AddArgument($Item.Size)
-            [void]$powershell.AddArgument($DisplayName)
-            [void]$powershell.AddArgument($RetryCount)
-            [void]$powershell.AddArgument($NoProgressTimeoutSeconds)
-            [void]$powershell.AddArgument($tempPath)
+            try {
+                $powershell.RunspacePool = $pool
+                [void]$powershell.AddScript($scriptBlock)
+                [void]$powershell.AddArgument([string[]]$Urls)
+                [void]$powershell.AddArgument($Item.Path)
+                [void]$powershell.AddArgument($Item.Sha1)
+                [void]$powershell.AddArgument($Item.Size)
+                [void]$powershell.AddArgument($DisplayName)
+                [void]$powershell.AddArgument($RetryCount)
+                [void]$powershell.AddArgument($NoProgressTimeoutSeconds)
+                [void]$powershell.AddArgument($tempPath)
+                $handle = $powershell.BeginInvoke()
 
-            [void]$jobs.Add([pscustomobject]@{
-                PowerShell = $powershell
-                Handle = $powershell.BeginInvoke()
-                Name = $DisplayName
-                Path = $Item.Path
-                Sha1 = $Item.Sha1
-                Size = $Item.Size
-                ProgressId = $ProgressId
-                Primary = $Primary
-                Key = ([string]$Item.Path).ToLowerInvariant()
-                TempPath = $tempPath
-            })
+                [void]$jobs.Add([pscustomobject]@{
+                    PowerShell = $powershell
+                    Handle = $handle
+                    Name = $DisplayName
+                    Path = $Item.Path
+                    Sha1 = $Item.Sha1
+                    Size = $Item.Size
+                    ProgressId = $ProgressId
+                    Primary = $Primary
+                    Key = ([string]$Item.Path).ToLowerInvariant()
+                    TempPath = $tempPath
+                })
+                return $true
+            } catch {
+                try {
+                    $powershell.Dispose()
+                } catch {
+                }
+                Remove-DownloadTempPath -Path $tempPath
+                if ($Primary) {
+                    $key = ([string]$Item.Path).ToLowerInvariant()
+                    if (-not $failureMessages.ContainsKey($key)) {
+                        $failureMessages[$key] = New-Object System.Collections.Generic.List[string]
+                    }
+                    $failureMessages[$key].Add("$DisplayName：启动下载任务失败：$($_.Exception.Message)")
+                }
+                return $false
+            }
         }
 
         function Stop-DuplicateDownloads {
@@ -1852,6 +2085,7 @@ function Download-Items {
                 [object]$Winner
             )
 
+            $stoppedPrimaryCount = 0
             for ($j = $jobs.Count - 1; $j -ge 0; $j--) {
                 $duplicate = $jobs[$j]
                 if ($duplicate.Key -ne $Key -or [object]::ReferenceEquals($duplicate, $Winner)) {
@@ -1866,11 +2100,13 @@ function Download-Items {
                     $duplicate.PowerShell.Dispose()
                 } catch {
                 }
-                if (Test-Path -LiteralPath $duplicate.TempPath -PathType Leaf) {
-                    Remove-Item -LiteralPath $duplicate.TempPath -Force -ErrorAction SilentlyContinue
+                if ($duplicate.Primary) {
+                    $stoppedPrimaryCount++
                 }
+                Remove-JobTempFile -Job $duplicate
                 $jobs.RemoveAt($j)
             }
+            return $stoppedPrimaryCount
         }
 
         function Remove-PendingHedges {
@@ -1881,6 +2117,16 @@ function Download-Items {
                     $pendingHedgeJobs.RemoveAt($h)
                 }
             }
+        }
+
+        function Reset-NextHedgeCheckAt {
+            $nextHedgeCheckAt = [datetime]::MaxValue
+            foreach ($hedge in $pendingHedgeJobs) {
+                if ($hedge.StartAt -lt $nextHedgeCheckAt) {
+                    $nextHedgeCheckAt = $hedge.StartAt
+                }
+            }
+            return $nextHedgeCheckAt
         }
 
         function Test-OtherDownloadRunning {
@@ -1895,6 +2141,96 @@ function Download-Items {
                 }
             }
             return $false
+        }
+
+        function Test-PendingHedgeExists {
+            param([string]$Key)
+
+            foreach ($hedge in $pendingHedgeJobs) {
+                if ((([string]$hedge.Item.Path).ToLowerInvariant()) -eq $Key) {
+                    return $true
+                }
+            }
+            return $false
+        }
+
+        function Remove-JobTempFile {
+            param([object]$Job)
+
+            if ($Job -eq $null -or [string]::IsNullOrWhiteSpace($Job.TempPath)) {
+                return
+            }
+            Remove-DownloadTempPath -Path $Job.TempPath
+        }
+
+        function Complete-DownloadJob {
+            param(
+                [object]$Job,
+                [object]$WorkerOutput = $null
+            )
+
+            if (Test-FileMatches -Path $Job.Path -Sha1 $Job.Sha1 -Size $Job.Size) {
+                Remove-JobTempFile -Job $Job
+                return [pscustomobject]@{
+                    Success = $true
+                    Message = "目标文件已存在且校验通过"
+                }
+            }
+
+            $tempVerifiedByWorker = $false
+            if ($WorkerOutput -ne $null -and
+                -not [string]::IsNullOrWhiteSpace([string]$WorkerOutput.TempSha1) -and
+                ([string]$WorkerOutput.TempSha1).ToLowerInvariant() -eq ([string]$Job.Sha1).ToLowerInvariant()) {
+                $tempFile = Get-Item -LiteralPath $Job.TempPath -ErrorAction SilentlyContinue
+                if ($tempFile -ne $null -and [Int64]$WorkerOutput.TempLength -eq [Int64]$tempFile.Length) {
+                    if ($Job.Size -eq $null -or $Job.Size -le 0 -or [Int64]$tempFile.Length -eq [Int64]$Job.Size) {
+                        $tempVerifiedByWorker = $true
+                    }
+                }
+            }
+
+            if (-not $tempVerifiedByWorker -and -not (Test-FileMatches -Path $Job.TempPath -Sha1 $Job.Sha1 -Size $Job.Size)) {
+                Remove-JobTempFile -Job $Job
+                return [pscustomobject]@{
+                    Success = $false
+                    Message = "临时文件校验失败"
+                }
+            }
+
+            try {
+                Ensure-DirectoryFast (Split-Path -Parent $Job.Path)
+                for ($moveAttempt = 1; $moveAttempt -le 3; $moveAttempt++) {
+                    try {
+                        Move-Item -LiteralPath $Job.TempPath -Destination $Job.Path -Force -ErrorAction Stop
+                        break
+                    } catch {
+                        if ($moveAttempt -ge 3) {
+                            throw
+                        }
+                        Start-Sleep -Milliseconds (120 * $moveAttempt)
+                    }
+                }
+
+                $moved = Test-FileMatches -Path $Job.Path -Sha1 $Job.Sha1 -Size $Job.Size
+                if (-not $moved) {
+                    Remove-JobTempFile -Job $Job
+                    return [pscustomobject]@{
+                        Success = $false
+                        Message = "移动到最终文件后校验失败"
+                    }
+                }
+
+                return [pscustomobject]@{
+                    Success = $true
+                    Message = "完成"
+                }
+            } catch {
+                Remove-JobTempFile -Job $Job
+                return [pscustomobject]@{
+                    Success = $false
+                    Message = "提交最终文件失败：$($_.Exception.Message)"
+                }
+            }
         }
 
         $pendingItems = New-Object System.Collections.ArrayList
@@ -1926,10 +2262,13 @@ function Download-Items {
         $completedKeys = @{}
         $validatedKeys = @{}
         $lastProgressUpdate = [datetime]::MinValue
+        $nextHedgeCheckAt = [datetime]::MaxValue
+        $activePrimaryDownloads = 0
         Write-FixedProgressLines -Title $Title -Done 0 -Total $total -ThreadCount $threadLimit -Initialize
 
         while ($jobs.Count -gt 0 -or $nextPendingItemIndex -lt $pendingItems.Count -or $pendingHedgeJobs.Count -gt 0) {
-            while ($nextPendingItemIndex -lt $pendingItems.Count -and $jobs.Count -lt $threadLimit) {
+            $processedCompletedJob = $false
+            while ($nextPendingItemIndex -lt $pendingItems.Count -and $activePrimaryDownloads -lt $threadLimit) {
                 $queued = $pendingItems[$nextPendingItemIndex]
                 $nextPendingItemIndex++
                 $item = $queued.Item
@@ -1943,44 +2282,69 @@ function Download-Items {
                     continue
                 }
 
-                Start-QueuedDownload -Item $item -Urls $queued.PrimaryUrls -DisplayName $item.Name -ProgressId $queued.ProgressId -Primary $true
-                if ($queued.HedgeUrls.Count -gt 0 -and $HedgeAfterSeconds -gt 0) {
+                $startedPrimary = Start-QueuedDownload -Item $item -Urls $queued.PrimaryUrls -DisplayName $item.Name -ProgressId $queued.ProgressId -Primary $true
+                if ($startedPrimary) {
+                    $activePrimaryDownloads++
+                }
+                $hedgeDelayMilliseconds = Resolve-HedgeDelayMilliseconds -Size $item.Size -PendingFileCount $Items.Count -RequestedDelaySeconds $HedgeAfterSeconds
+                if ($queued.HedgeUrls.Count -gt 0 -and $hedgeDelayMilliseconds -ge 0) {
+                    $hedgeStartAt = (Get-Date).AddMilliseconds($hedgeDelayMilliseconds)
                     [void]$pendingHedgeJobs.Add([pscustomobject]@{
                         Item = $item
                         Urls = $queued.HedgeUrls
-                        StartAt = (Get-Date).AddSeconds($HedgeAfterSeconds)
+                        StartAt = $hedgeStartAt
                         ProgressId = $queued.ProgressId
                     })
+                    if ($hedgeStartAt -lt $nextHedgeCheckAt) {
+                        $nextHedgeCheckAt = $hedgeStartAt
+                    }
                 }
             }
 
             $now = Get-Date
-            for ($h = $pendingHedgeJobs.Count - 1; $h -ge 0; $h--) {
-                $hedge = $pendingHedgeJobs[$h]
-                if ($now -lt $hedge.StartAt) {
-                    continue
-                }
-
-                $item = $hedge.Item
-                $key = ([string]$item.Path).ToLowerInvariant()
-                if ($completedKeys.ContainsKey($key)) {
-                    $pendingHedgeJobs.RemoveAt($h)
-                    continue
-                }
-
-                if (Test-FileMatches -Path $item.Path -Sha1 $item.Sha1 -Size $item.Size) {
-                    if (-not $completedKeys.ContainsKey($key)) {
-                        $completedKeys[$key] = $true
-                        $validatedKeys[$key] = $true
-                        $done++
+            if ($pendingHedgeJobs.Count -gt 0 -and $now -ge $nextHedgeCheckAt) {
+                $nextHedgeCheckAt = [datetime]::MaxValue
+                for ($h = $pendingHedgeJobs.Count - 1; $h -ge 0; $h--) {
+                    $hedge = $pendingHedgeJobs[$h]
+                    if ($now -lt $hedge.StartAt) {
+                        if ($hedge.StartAt -lt $nextHedgeCheckAt) {
+                            $nextHedgeCheckAt = $hedge.StartAt
+                        }
+                        continue
                     }
-                    $pendingHedgeJobs.RemoveAt($h)
-                    continue
-                }
 
-                if ($jobs.Count -lt $runspaceLimit) {
-                    Start-QueuedDownload -Item $item -Urls $hedge.Urls -DisplayName "$($item.Name)（备用源）" -ProgressId $hedge.ProgressId -Primary $false
-                    $pendingHedgeJobs.RemoveAt($h)
+                    $item = $hedge.Item
+                    $key = ([string]$item.Path).ToLowerInvariant()
+                    if ($completedKeys.ContainsKey($key)) {
+                        $pendingHedgeJobs.RemoveAt($h)
+                        continue
+                    }
+
+                    if (Test-FileMatches -Path $item.Path -Sha1 $item.Sha1 -Size $item.Size) {
+                        if (-not $completedKeys.ContainsKey($key)) {
+                            $completedKeys[$key] = $true
+                            $validatedKeys[$key] = $true
+                            $done++
+                        }
+                        $pendingHedgeJobs.RemoveAt($h)
+                        continue
+                    }
+
+                    if ($jobs.Count -lt $runspaceLimit) {
+                        $startedHedge = Start-QueuedDownload -Item $item -Urls $hedge.Urls -DisplayName "$($item.Name)（备用源）" -ProgressId $hedge.ProgressId -Primary $false
+                        if ($startedHedge) {
+                            $pendingHedgeJobs.RemoveAt($h)
+                        } else {
+                            $nextHedgeCheckAt = $now.AddMilliseconds(50)
+                            break
+                        }
+                    } else {
+                        $nextHedgeCheckAt = $now.AddMilliseconds(50)
+                        break
+                    }
+                }
+                if ($pendingHedgeJobs.Count -eq 0) {
+                    $nextHedgeCheckAt = [datetime]::MaxValue
                 }
             }
 
@@ -1991,10 +2355,12 @@ function Download-Items {
                 }
 
                 $outputs = $job.PowerShell.EndInvoke($job.Handle)
+                $processedCompletedJob = $true
                 $jobSucceeded = $false
+                $successOutput = $null
                 foreach ($output in $outputs) {
                     if ($output.Status -eq "失败") {
-                        if ((Test-OtherDownloadRunning -Key $job.Key -CurrentJob $job) -or (Test-FileMatches -Path $job.Path -Sha1 $job.Sha1 -Size $job.Size)) {
+                        if ((Test-OtherDownloadRunning -Key $job.Key -CurrentJob $job) -or (Test-PendingHedgeExists -Key $job.Key) -or (Test-FileMatches -Path $job.Path -Sha1 $job.Sha1 -Size $job.Size)) {
                             continue
                         } else {
                             if (-not $failureMessages.ContainsKey($job.Key)) {
@@ -2005,34 +2371,58 @@ function Download-Items {
                         }
                     } elseif ($output.Status -eq "完成" -or $output.Status -eq "跳过") {
                         $jobSucceeded = $true
+                        if ($output.Status -eq "完成") {
+                            $successOutput = $output
+                        }
                     }
                 }
 
                 $job.PowerShell.Dispose()
                 $jobs.RemoveAt($i)
+                if ($job.Primary -and $activePrimaryDownloads -gt 0) {
+                    $activePrimaryDownloads--
+                }
+                $completion = $null
                 if ($jobSucceeded -and -not $completedKeys.ContainsKey($job.Key)) {
+                    $completion = Complete-DownloadJob -Job $job -WorkerOutput $successOutput
+                }
+                if ($completion -ne $null -and $completion.Success) {
                     $completedKeys[$job.Key] = $true
                     $validatedKeys[$job.Key] = $true
                     Set-FileValidationCacheEntry -Path $job.Path -Sha1 $job.Sha1
-                    Stop-DuplicateDownloads -Key $job.Key -Winner $job
+                    $stoppedPrimaryCount = Stop-DuplicateDownloads -Key $job.Key -Winner $job
+                    if ($stoppedPrimaryCount -gt 0) {
+                        $activePrimaryDownloads = [Math]::Max(0, $activePrimaryDownloads - $stoppedPrimaryCount)
+                    }
                     $done++
                     if ($done -gt $total) {
                         $done = $total
                     }
 
                     Remove-PendingHedges -Key $job.Key
+                    $nextHedgeCheckAt = Reset-NextHedgeCheckAt
                     break
+                } elseif ($completion -ne $null -and -not $completion.Success) {
+                    if (-not $failureMessages.ContainsKey($job.Key)) {
+                        $failureMessages[$job.Key] = New-Object System.Collections.Generic.List[string]
+                    }
+                    $failureMessages[$job.Key].Add("$($job.Name)：$($completion.Message)")
                 } elseif ((Test-FileMatches -Path $job.Path -Sha1 $job.Sha1 -Size $job.Size) -and -not $completedKeys.ContainsKey($job.Key)) {
+                    Remove-JobTempFile -Job $job
                     $completedKeys[$job.Key] = $true
                     $validatedKeys[$job.Key] = $true
                     Set-FileValidationCacheEntry -Path $job.Path -Sha1 $job.Sha1
-                    Stop-DuplicateDownloads -Key $job.Key -Winner $job
+                    $stoppedPrimaryCount = Stop-DuplicateDownloads -Key $job.Key -Winner $job
+                    if ($stoppedPrimaryCount -gt 0) {
+                        $activePrimaryDownloads = [Math]::Max(0, $activePrimaryDownloads - $stoppedPrimaryCount)
+                    }
                     $done++
                     if ($done -gt $total) {
                         $done = $total
                     }
 
                     Remove-PendingHedges -Key $job.Key
+                    $nextHedgeCheckAt = Reset-NextHedgeCheckAt
                     break
                 }
             }
@@ -2042,7 +2432,12 @@ function Download-Items {
                 $currentName = ""
                 $currentDoneBytes = [Int64]0
                 $currentTotalBytes = [Int64]0
+                $progressProbeCount = 0
                 foreach ($job in $jobs) {
+                    $progressProbeCount++
+                    if ($progressProbeCount -gt 24) {
+                        break
+                    }
                     $tempPath = $job.TempPath
                     if (-not (Test-Path -LiteralPath $tempPath -PathType Leaf)) {
                         continue
@@ -2066,7 +2461,14 @@ function Download-Items {
                 Write-FixedProgressLines -Title $Title -Done $done -Total $total -ThreadCount $threadLimit -FileName $currentName -FileDoneBytes $currentDoneBytes -FileTotalBytes $currentTotalBytes
                 $lastProgressUpdate = $progressNow
             }
-            Start-Sleep -Milliseconds 100
+            $sleepMilliseconds = 50
+            if ($processedCompletedJob) {
+                $sleepMilliseconds = 5
+            } elseif ($pendingHedgeJobs.Count -gt 0 -and $nextHedgeCheckAt -ne [datetime]::MaxValue) {
+                $millisecondsUntilHedge = [int][Math]::Ceiling(($nextHedgeCheckAt - (Get-Date)).TotalMilliseconds)
+                $sleepMilliseconds = [Math]::Max(5, [Math]::Min(50, $millisecondsUntilHedge))
+            }
+            Start-Sleep -Milliseconds $sleepMilliseconds
         }
 
         $failed = New-Object System.Collections.Generic.List[string]
@@ -2097,9 +2499,13 @@ function Download-Items {
                 $job.PowerShell.Dispose()
             } catch {
             }
+            Remove-JobTempFile -Job $job
         }
         $pool.Close()
         $pool.Dispose()
+        foreach ($tempPath in @($downloadTempPaths.Values)) {
+            Remove-DownloadTempPath -Path $tempPath
+        }
     }
 }
 
@@ -2197,7 +2603,7 @@ try {
     }
 
     if (-not $MaxThreadsWasProvided) {
-        $MaxThreads = Read-ThreadCount -DefaultThreads 16
+        $MaxThreads = Read-ThreadCount -DefaultThreads 0
         Write-Host ""
     }
 
@@ -2211,7 +2617,11 @@ try {
         Write-Host "Fabric 加载器：$FabricLoaderVersion"
     }
     Write-Host "安装目录：$MinecraftDir"
-    Write-Host "下载线程：$MaxThreads"
+    if ($MaxThreads -gt 0) {
+        Write-Host "下载线程：$MaxThreads"
+    } else {
+        Write-Host "下载线程：自动动态"
+    }
     Write-Host "失败重试：$RetryCount 次"
     Write-Host "无进度重连：$NoProgressTimeoutSeconds 秒"
     Write-Host "竞速下载延迟：$HedgeAfterSeconds 秒"
