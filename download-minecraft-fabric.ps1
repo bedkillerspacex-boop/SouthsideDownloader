@@ -36,6 +36,7 @@ $LibrariesBase = "https://libraries.minecraft.net"
 $AssetsBase = "https://resources.download.minecraft.net"
 $FabricMetaBase = "https://meta.fabricmc.net"
 $FabricMavenBase = "https://maven.fabricmc.net"
+$script:ExitCleanupDirectories = New-Object System.Collections.Generic.List[string]
 
 function Show-Help {
     Write-Host "南侧下载器 - 自动下载 Minecraft $MinecraftVersion + Fabric"
@@ -80,6 +81,58 @@ function Ensure-Directory {
 
     if (-not [string]::IsNullOrWhiteSpace($Path) -and -not (Test-Path -LiteralPath $Path)) {
         New-Item -ItemType Directory -Path $Path | Out-Null
+    }
+}
+
+function Test-SafeTempChildPath {
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return $false
+    }
+
+    try {
+        $tempRoot = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath()).TrimEnd("\")
+        $target = [System.IO.Path]::GetFullPath($Path).TrimEnd("\")
+        return $target.StartsWith("$tempRoot\", [System.StringComparison]::OrdinalIgnoreCase) -and
+            -not $target.Equals($tempRoot, [System.StringComparison]::OrdinalIgnoreCase)
+    } catch {
+        return $false
+    }
+}
+
+function Register-ExitDirectoryCleanup {
+    param([string]$Path)
+
+    if (-not (Test-SafeTempChildPath -Path $Path)) {
+        return
+    }
+
+    $fullPath = [System.IO.Path]::GetFullPath($Path).TrimEnd("\")
+    foreach ($existingPath in $script:ExitCleanupDirectories) {
+        if ($existingPath.Equals($fullPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+            return
+        }
+    }
+    [void]$script:ExitCleanupDirectories.Add($fullPath)
+}
+
+function Invoke-ExitDirectoryCleanup {
+    foreach ($path in @($script:ExitCleanupDirectories)) {
+        if (-not (Test-SafeTempChildPath -Path $path)) {
+            continue
+        }
+
+        for ($attempt = 0; $attempt -lt 3; $attempt++) {
+            try {
+                if (Test-Path -LiteralPath $path -PathType Container) {
+                    Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction Stop
+                }
+                break
+            } catch {
+                Start-Sleep -Milliseconds 200
+            }
+        }
     }
 }
 
@@ -215,6 +268,30 @@ function Convert-ToHtmlText {
     return [System.Net.WebUtility]::HtmlEncode($Text)
 }
 
+function Start-DelayedDirectoryCleanup {
+    param(
+        [string]$Path,
+        [int]$DelaySeconds = 90
+    )
+
+    if (-not (Test-SafeTempChildPath -Path $Path) -or -not (Test-Path -LiteralPath $Path -PathType Container)) {
+        return
+    }
+
+    try {
+        $encodedPath = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($Path))
+        $script = @"
+Start-Sleep -Seconds $DelaySeconds
+`$path = [System.Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('$encodedPath'))
+Remove-Item -LiteralPath `$path -Recurse -Force -ErrorAction SilentlyContinue
+"@
+        $encodedCommand = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($script))
+        $powershellPath = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+        Start-Process -FilePath $powershellPath -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", $encodedCommand) -WindowStyle Hidden | Out-Null
+    } catch {
+    }
+}
+
 function Show-InstallTutorial {
     param(
         [string]$InstallVersionName,
@@ -227,6 +304,7 @@ function Show-InstallTutorial {
     $shortcutName = "南方启动器"
     $tutorialDir = Join-Path $env:TEMP "SouthSideDownloader"
     Ensure-Directory $tutorialDir
+    Register-ExitDirectoryCleanup -Path $tutorialDir
     $tutorialPath = $null
     $helpZipPath = Join-Parts @($PSScriptRoot, "resources", "help.zip")
 
@@ -318,6 +396,7 @@ function Show-InstallTutorial {
         try {
             Start-Process -FilePath $browserPath -ArgumentList @("--new-window", $tutorialPath) | Out-Null
             $openedTutorial = $true
+            Start-DelayedDirectoryCleanup -Path $tutorialDir
             break
         } catch {
         }
@@ -1767,6 +1846,57 @@ function Download-Items {
             })
         }
 
+        function Stop-DuplicateDownloads {
+            param(
+                [string]$Key,
+                [object]$Winner
+            )
+
+            for ($j = $jobs.Count - 1; $j -ge 0; $j--) {
+                $duplicate = $jobs[$j]
+                if ($duplicate.Key -ne $Key -or [object]::ReferenceEquals($duplicate, $Winner)) {
+                    continue
+                }
+
+                try {
+                    $duplicate.PowerShell.Stop()
+                } catch {
+                }
+                try {
+                    $duplicate.PowerShell.Dispose()
+                } catch {
+                }
+                if (Test-Path -LiteralPath $duplicate.TempPath -PathType Leaf) {
+                    Remove-Item -LiteralPath $duplicate.TempPath -Force -ErrorAction SilentlyContinue
+                }
+                $jobs.RemoveAt($j)
+            }
+        }
+
+        function Remove-PendingHedges {
+            param([string]$Key)
+
+            for ($h = $pendingHedgeJobs.Count - 1; $h -ge 0; $h--) {
+                if ((([string]$pendingHedgeJobs[$h].Item.Path).ToLowerInvariant()) -eq $Key) {
+                    $pendingHedgeJobs.RemoveAt($h)
+                }
+            }
+        }
+
+        function Test-OtherDownloadRunning {
+            param(
+                [string]$Key,
+                [object]$CurrentJob
+            )
+
+            foreach ($candidate in $jobs) {
+                if ($candidate.Key -eq $Key -and -not [object]::ReferenceEquals($candidate, $CurrentJob)) {
+                    return $true
+                }
+            }
+            return $false
+        }
+
         $pendingItems = New-Object System.Collections.ArrayList
         $nextPendingItemIndex = 0
         $pendingHedgeJobs = New-Object System.Collections.ArrayList
@@ -1864,7 +1994,9 @@ function Download-Items {
                 $jobSucceeded = $false
                 foreach ($output in $outputs) {
                     if ($output.Status -eq "失败") {
-                        if (-not (Test-FileMatches -Path $job.Path -Sha1 $job.Sha1 -Size $job.Size)) {
+                        if ((Test-OtherDownloadRunning -Key $job.Key -CurrentJob $job) -or (Test-FileMatches -Path $job.Path -Sha1 $job.Sha1 -Size $job.Size)) {
+                            continue
+                        } else {
                             if (-not $failureMessages.ContainsKey($job.Key)) {
                                 $failureMessages[$job.Key] = New-Object System.Collections.Generic.List[string]
                             }
@@ -1882,30 +2014,26 @@ function Download-Items {
                     $completedKeys[$job.Key] = $true
                     $validatedKeys[$job.Key] = $true
                     Set-FileValidationCacheEntry -Path $job.Path -Sha1 $job.Sha1
+                    Stop-DuplicateDownloads -Key $job.Key -Winner $job
                     $done++
                     if ($done -gt $total) {
                         $done = $total
                     }
 
-                    for ($h = $pendingHedgeJobs.Count - 1; $h -ge 0; $h--) {
-                        if ((([string]$pendingHedgeJobs[$h].Item.Path).ToLowerInvariant()) -eq $job.Key) {
-                            $pendingHedgeJobs.RemoveAt($h)
-                        }
-                    }
+                    Remove-PendingHedges -Key $job.Key
+                    break
                 } elseif ((Test-FileMatches -Path $job.Path -Sha1 $job.Sha1 -Size $job.Size) -and -not $completedKeys.ContainsKey($job.Key)) {
                     $completedKeys[$job.Key] = $true
                     $validatedKeys[$job.Key] = $true
                     Set-FileValidationCacheEntry -Path $job.Path -Sha1 $job.Sha1
+                    Stop-DuplicateDownloads -Key $job.Key -Winner $job
                     $done++
                     if ($done -gt $total) {
                         $done = $total
                     }
 
-                    for ($h = $pendingHedgeJobs.Count - 1; $h -ge 0; $h--) {
-                        if ((([string]$pendingHedgeJobs[$h].Item.Path).ToLowerInvariant()) -eq $job.Key) {
-                            $pendingHedgeJobs.RemoveAt($h)
-                        }
-                    }
+                    Remove-PendingHedges -Key $job.Key
+                    break
                 }
             }
 
@@ -2271,4 +2399,6 @@ try {
         Read-Host "按回车键退出"
     }
     exit 1
+} finally {
+    Invoke-ExitDirectoryCleanup
 }

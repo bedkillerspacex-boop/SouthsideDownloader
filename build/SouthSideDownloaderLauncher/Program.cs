@@ -49,10 +49,17 @@ var startInfo = new ProcessStartInfo
     UseShellExecute = false
 };
 
-using var process = Process.Start(startInfo)
-    ?? throw new InvalidOperationException("Cannot start installer script");
-process.WaitForExit();
-return process.ExitCode;
+int exitCode;
+using (var process = Process.Start(startInfo)
+    ?? throw new InvalidOperationException("Cannot start installer script"))
+{
+    process.WaitForExit();
+    exitCode = process.ExitCode;
+}
+
+TryDeleteDirectory(extractRoot);
+TryDeleteEmptyParent(Path.Combine(Path.GetTempPath(), "SouthSideDownloaderExe"));
+return exitCode;
 
 static string QuoteArgument(string value)
 {
@@ -92,4 +99,61 @@ static async Task ExtractResourceAsync(Assembly assembly, string resourceName, s
     await input.CopyToAsync(output);
     await output.DisposeAsync();
     File.Move(tempPath, targetPath, true);
+}
+
+static void TryDeleteDirectory(string path)
+{
+    if (!IsSafeTempChildPath(path) || !Directory.Exists(path))
+    {
+        return;
+    }
+
+    for (var attempt = 0; attempt < 3; attempt++)
+    {
+        try
+        {
+            Directory.Delete(path, true);
+            return;
+        }
+        catch
+        {
+            Thread.Sleep(200);
+        }
+    }
+}
+
+static void TryDeleteEmptyParent(string path)
+{
+    if (!IsSafeTempChildPath(path) || !Directory.Exists(path))
+    {
+        return;
+    }
+
+    try
+    {
+        Directory.Delete(path, false);
+    }
+    catch
+    {
+    }
+}
+
+static bool IsSafeTempChildPath(string path)
+{
+    if (string.IsNullOrWhiteSpace(path))
+    {
+        return false;
+    }
+
+    try
+    {
+        var tempRoot = Path.GetFullPath(Path.GetTempPath()).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        var target = Path.GetFullPath(path).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        return target.StartsWith(tempRoot + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)
+            && !target.Equals(tempRoot, StringComparison.OrdinalIgnoreCase);
+    }
+    catch
+    {
+        return false;
+    }
 }
