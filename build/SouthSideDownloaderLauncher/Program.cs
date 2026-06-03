@@ -1,5 +1,14 @@
 using System.Diagnostics;
 using System.Reflection;
+using System.Security.Principal;
+
+if (!IsRunningAsAdministrator())
+{
+    Console.WriteLine("请右键选择“以管理员身份运行”本程序。");
+    Console.WriteLine("按回车键退出...");
+    Console.ReadLine();
+    return 1;
+}
 
 var assembly = Assembly.GetExecutingAssembly();
 var appPath = Environment.ProcessPath ?? Process.GetCurrentProcess().MainModule?.FileName ?? AppContext.BaseDirectory;
@@ -77,6 +86,13 @@ static bool IsHelpArgument(string value)
         || value.Equals("--help", StringComparison.OrdinalIgnoreCase)
         || value.Equals("/Help", StringComparison.OrdinalIgnoreCase)
         || value.Equals("/?", StringComparison.OrdinalIgnoreCase);
+}
+
+static bool IsRunningAsAdministrator()
+{
+    using var identity = WindowsIdentity.GetCurrent();
+    var principal = new WindowsPrincipal(identity);
+    return principal.IsInRole(WindowsBuiltInRole.Administrator);
 }
 
 static async Task ExtractResourceAsync(Assembly assembly, string resourceName, string targetPath)

@@ -2607,6 +2607,7 @@ try {
         Write-Host ""
     }
 
+    Write-Host "GitHub 仓库：https://github.com/bedkillerspacex-boop/SouthsideDownloader"
     Write-Host "由 bsk 和 Ezplus 制作"
     Write-Host "南侧下载器已启动"
     Write-Host "Minecraft 版本：$MinecraftVersion"
